@@ -276,10 +276,10 @@
         </svg>
       </button>
     </div>
-    <div class="mic-hint">Voice input is multilingual. Text input below always uses English.</div>
+    <div class="mic-hint">Voice and text input work in English and the supported Indian languages. Your words are shown exactly as spoken or typed.</div>
 
     <form class="text-row" id="textForm">
-      <input type="text" id="textInput" placeholder="Or type a question in English" autocomplete="off">
+      <input type="text" id="textInput" placeholder="Or type a question in any supported language" autocomplete="off">
       <button type="submit">Send</button>
     </form>
   </div>
@@ -318,6 +318,7 @@ function addBubble(role, text, lang, audioUrl) {
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   bubble.dataset.lang = lang || 'en-IN';
+  if (lang) bubble.lang = lang;
   bubble.dataset.audioUrl = audioUrl || '';
   bubble.appendChild(document.createTextNode(text));
   if (role === 'assistant' && text) {
@@ -559,7 +560,7 @@ async function onRecordingStop() {
     const res = await fetch('/api/voice_message', { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
-      addBubble('user', data.user_text);
+      addBubble('user', data.user_text, data.speech_lang);
       addBubble('assistant', data.answer, data.speech_lang, data.audio_url);
       // Immediate playback - no extra tap required. Uses the real
       // server-generated audio (in the input language) when available,
