@@ -75,80 +75,86 @@ def api_answer_mode():
     return jsonify({"ok": True, "mode": new_mode})
 
 
+_SORRY = "Sorry, something went wrong while generating a response. Please try again in a moment."
+
+
+def _recent_history(username, drop_last_user=False):
+    """The last few messages, which is all the answer prompt ever uses (it
+    used to load 200 rows to keep 6). With drop_last_user, the question that
+    was just saved is left out so it isn't sent to the model twice."""
+    msgs = modl.get_messages(username, limit=7 if drop_last_user else 6)
+    if drop_last_user and msgs and msgs[-1]["role"] == "user":
+        msgs = msgs[:-1]
+    return msgs
+
+
+def _reply(text, lang, history):
+    """Answer `text` (in `lang`) and return the reply in the same language.
+    Translation to English happens inside modl.respond(), only for the
+    answer step - the user's own text is stored and shown exactly as given."""
+    try:
+        return modl.respond(text, lang, history)
+    except Exception:
+        app.logger.exception("failed generating an answer")
+        return modl.translate_text(_SORRY, lang)
+
+
 @app.route("/api/text_message", methods=["POST"])
 def api_text_message():
-    """Typed-question chat, always in English."""
+    """Typed question. The language is detected from the script, so a
+    question typed in Telugu gets a Telugu answer; the text is shown and
+    stored exactly as typed."""
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get("text") or "").strip()
     if not text:
         return jsonify({"ok": False, "error": "Empty message."}), 400
 
-    modl.add_message(CHAT_USER, "user", text, "en", source="web")
+    lang = modl.detect_text_language(text)
+    history = _recent_history(CHAT_USER)
+    modl.add_message(CHAT_USER, "user", text, lang, source="web")
 
-    try:
-        history = modl.get_messages(CHAT_USER)
-        answer_en = modl.answer_query(text, history)
-    except Exception:
-        app.logger.exception("api_text_message: failed generating an answer")
-        answer_en = "Sorry, something went wrong while generating a response. Please try again in a moment."
-
-    last_id = modl.add_message(CHAT_USER, "assistant", answer_en, "en", source="web")
-    audio_url = _synthesize_for_web(answer_en, "en")
+    answer = _reply(text, lang, history)
+    last_id = modl.add_message(CHAT_USER, "assistant", answer, lang, source="web")
     return jsonify({
-        "ok": True, "user_text": text, "lang": "en", "answer": answer_en,
-        "speech_lang": "en-IN", "audio_url": audio_url, "last_id": last_id,
+        "ok": True, "user_text": text, "lang": lang, "answer": answer,
+        "speech_lang": modl.bcp47_for_lang(lang),
+        "audio_url": _synthesize_for_web(answer, lang), "last_id": last_id,
     })
 
 
 @app.route("/api/voice_message", methods=["POST"])
 def api_voice_message():
-    """Recorded voice clip from the browser mic: speech-to-text +
-    translation to English, an answer, then translation back for
-    text-to-speech playback on the client."""
+    """Recorded voice clip from the browser mic. The transcript is kept in
+    the spoken language and is what gets displayed and stored."""
     audio = request.files.get("audio")
     if not audio:
         return jsonify({"ok": False, "error": "No audio received."}), 400
 
     ext = ".wav" if (audio.filename or "").lower().endswith(".wav") else ".webm"
-    filename = f"{uuid.uuid4()}{ext}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    filepath = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}{ext}")
     audio.save(filepath)
 
     try:
-        stt = modl.transcribe_and_translate(filepath)
+        stt = modl.transcribe(filepath)
     except Exception as e:
         app.logger.exception("api_voice_message: speech recognition failed")
         return jsonify({"ok": False, "error": f"Speech recognition failed: {e}"}), 500
     finally:
-        try:
-            os.remove(filepath)
-        except OSError:
-            pass
+        _remove_quietly(filepath)
 
-    text_original = stt["text_original"]
-    lang = stt["lang"]
-    text_english = stt["text_english"]
-    if not text_original:
+    text, lang = stt["text"], stt["lang"]
+    if not text:
         return jsonify({"ok": False, "error": "Could not detect any speech. Please try again."}), 400
 
-    modl.add_message(CHAT_USER, "user", text_original, lang, source="web")
+    history = _recent_history(CHAT_USER)
+    modl.add_message(CHAT_USER, "user", text, lang, source="web")
 
-    try:
-        history = modl.get_messages(CHAT_USER)
-        answer_en = modl.answer_query(text_english, history)
-        answer_translated = modl.translate_text(answer_en, lang)
-    except Exception:
-        app.logger.exception("api_voice_message: failed generating an answer")
-        answer_translated = modl.translate_text(
-            "Sorry, something went wrong while generating a response. Please try again in a moment.", lang)
-
-    last_id = modl.add_message(CHAT_USER, "assistant", answer_translated, lang, source="web")
-    speech_lang = modl.bcp47_for_lang(lang)
-    audio_url = _synthesize_for_web(answer_translated, lang)
-
+    answer = _reply(text, lang, history)
+    last_id = modl.add_message(CHAT_USER, "assistant", answer, lang, source="web")
     return jsonify({
-        "ok": True, "user_text": text_original, "lang": lang, "answer": answer_translated,
-        "speech_lang": speech_lang, "audio_url": audio_url, "last_id": last_id,
+        "ok": True, "user_text": text, "lang": lang, "answer": answer,
+        "speech_lang": modl.bcp47_for_lang(lang),
+        "audio_url": _synthesize_for_web(answer, lang), "last_id": last_id,
     })
 
 
@@ -179,61 +185,65 @@ def esp_health():
     })
 
 
-def _cleanup_esp_audio(max_age_seconds=600):
-    now = time.time()
+def _remove_quietly(path):
     try:
-        for fname in os.listdir(ESP_AUDIO_DIR):
-            fpath = os.path.join(ESP_AUDIO_DIR, fname)
+        os.remove(path)
+    except OSError:
+        pass
+
+
+_last_cleanup = {}
+
+
+def _cleanup_dir(directory, max_age_seconds=600):
+    """Deletes old generated audio. Runs at most once a minute per folder
+    instead of listing the folder on every single request."""
+    now = time.time()
+    if now - _last_cleanup.get(directory, 0) < 60:
+        return
+    _last_cleanup[directory] = now
+    try:
+        for fname in os.listdir(directory):
+            fpath = os.path.join(directory, fname)
             if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > max_age_seconds:
                 os.remove(fpath)
     except OSError:
         pass
 
 
-def _cleanup_web_audio(max_age_seconds=600):
-    now = time.time()
+def _synthesize_to(directory, url_prefix, text, lang):
+    """Speaks `text` into a new WAV in `directory` (Bhashini -> espeak-ng ->
+    Groq TTS, see modl.synthesize_speech). Returns (url, error)."""
+    _cleanup_dir(directory)
+    audio_id = f"{uuid.uuid4()}.wav"
     try:
-        for fname in os.listdir(WEB_AUDIO_DIR):
-            fpath = os.path.join(WEB_AUDIO_DIR, fname)
-            if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > max_age_seconds:
-                os.remove(fpath)
-    except OSError:
-        pass
+        modl.synthesize_speech(text, lang, os.path.join(directory, audio_id))
+        return f"{url_prefix}/{audio_id}", None
+    except Exception as e:
+        app.logger.exception("speech synthesis failed")
+        return None, f"Speech synthesis failed: {e}"
 
 
 def _synthesize_for_web(text, lang):
-    """Generates a WAV file for the browser to play, using the same
-    Bhashini -> espeak-ng -> Groq TTS priority chain as the ESP32 device,
-    instead of leaving audio to the browser's own speechSynthesis. This
-    is what guarantees the reply is actually spoken in the input
-    language: most browsers/OSes simply don't ship an installed voice for
-    languages like Telugu, Tamil, Bengali, etc., so speechSynthesis
-    silently falls back to whatever default voice is installed (usually
-    English) - it plays *something*, just not in the right language.
-    Generating the audio ourselves sidesteps that entirely. Returns a URL
-    path the browser can GET, or None if synthesis isn't available/fails
-    (the browser then falls back to speechSynthesis - fine for English,
-    better than nothing for other languages)."""
+    """URL of server-generated audio in the reply language, or None (the
+    browser then falls back to speechSynthesis). Generating the audio here
+    is what guarantees e.g. Telugu is actually spoken in Telugu - most
+    browsers have no installed voice for it and silently use English."""
     if not modl.tts_available():
         return None
-    _cleanup_web_audio()
-    audio_id = f"{uuid.uuid4()}.wav"
-    audio_path = os.path.join(WEB_AUDIO_DIR, audio_id)
-    try:
-        modl.synthesize_speech(text, lang, audio_path)
-        return f"/audio/{audio_id}"
-    except Exception:
-        app.logger.exception("_synthesize_for_web: speech synthesis failed")
-        return None
+    return _synthesize_to(WEB_AUDIO_DIR, "/audio", text, lang)[0]
+
+
+def _send_wav(directory, filename):
+    filepath = os.path.join(directory, os.path.basename(filename))
+    if not os.path.isfile(filepath):
+        abort(404)
+    return send_file(filepath, mimetype="audio/wav", conditional=False)
 
 
 @app.route("/audio/<filename>")
 def web_audio(filename):
-    safe_name = os.path.basename(filename)
-    filepath = os.path.join(WEB_AUDIO_DIR, safe_name)
-    if not os.path.isfile(filepath):
-        abort(404)
-    return send_file(filepath, mimetype="audio/wav", conditional=False)
+    return _send_wav(WEB_AUDIO_DIR, filename)
 
 
 def _write_wav_header(f, data_bytes, sample_rate, bits_per_sample, num_channels):
@@ -261,7 +271,8 @@ ESP_MAX_UPLOAD_BYTES = 16000 * 2 * 60  # ~60s at 16kHz/16-bit mono
 def esp_transcribe():
     """Body: raw 16-bit PCM mono audio, streamed chunk-by-chunk by the
     ESP32 while the button is held - never buffered as a whole file on
-    the device."""
+    the device. `text_original` is exactly what was spoken; `text_english`
+    is included only because the device sends it back to /esp/answer."""
     if not _check_esp_auth():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
@@ -270,8 +281,7 @@ def esp_transcribe():
     except ValueError:
         sample_rate = 16000
 
-    filename = f"{uuid.uuid4()}.wav"
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    filepath = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.wav")
     total_bytes = 0
     try:
         with open(filepath, "wb") as f:
@@ -288,17 +298,11 @@ def esp_transcribe():
             f.seek(0)
             _write_wav_header(f, total_bytes, sample_rate, 16, 1)
     except Exception as e:
-        try:
-            os.remove(filepath)
-        except OSError:
-            pass
+        _remove_quietly(filepath)
         return jsonify({"ok": False, "error": f"Upload failed: {e}"}), 500
 
     if total_bytes < 100:
-        try:
-            os.remove(filepath)
-        except OSError:
-            pass
+        _remove_quietly(filepath)
         return jsonify({"ok": False, "error": "No audio received."}), 400
 
     try:
@@ -306,69 +310,56 @@ def esp_transcribe():
     except Exception as e:
         return jsonify({"ok": False, "error": f"Speech recognition failed: {e}"}), 500
     finally:
-        try:
-            os.remove(filepath)
-        except OSError:
-            pass
+        _remove_quietly(filepath)
 
     if not stt["text_original"]:
         return jsonify({"ok": False, "error": "No speech detected."}), 400
 
     modl.add_message(DEVICE_USER, "user", stt["text_original"], stt["lang"], source="esp32")
     return jsonify({"ok": True, "text_original": stt["text_original"],
-                     "text_english": stt["text_english"], "lang": stt["lang"]})
+                    "text_english": stt["text_english"], "lang": stt["lang"]})
 
 
 @app.route("/esp/answer", methods=["POST"])
 def esp_answer():
-    """Body: JSON {text_english, lang}. Generates an answer and, separately,
-    tries to speak it - a TTS failure never hides the text answer."""
+    """Body: JSON {text_english, lang} (text_original is optional and is
+    only used if text_english is missing). Generates an answer and,
+    separately, tries to speak it - a TTS failure never hides the text."""
     if not _check_esp_auth():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
     data = request.get_json(force=True, silent=True) or {}
     text_english = (data.get("text_english") or "").strip()
+    text_original = (data.get("text_original") or "").strip()
     lang = (data.get("lang") or "en").strip()
-    if not text_english:
+    if not (text_english or text_original):
         return jsonify({"ok": False, "error": "Missing text_english."}), 400
 
     try:
-        history = modl.get_messages(DEVICE_USER)
-        answer_en = modl.answer_query(text_english, history)
-        answer_translated = modl.translate_text(answer_en, lang)
+        history = _recent_history(DEVICE_USER, drop_last_user=True)
+        answer = modl.respond(text_original or text_english, lang, history,
+                              text_english=text_english or None)
     except Exception as e:
         app.logger.exception("esp_answer: failed generating an answer")
         return jsonify({"ok": False, "error": f"Failed to generate an answer: {e}"}), 500
 
-    modl.add_message(DEVICE_USER, "assistant", answer_translated, lang, source="esp32")
+    modl.add_message(DEVICE_USER, "assistant", answer, lang, source="esp32")
 
     audio_url, tts_error = None, None
     if not modl.tts_available():
         tts_error = "No text-to-speech backend is configured - see README.md. The text answer was still generated and saved."
         app.logger.warning("esp_answer: %s", tts_error)
     else:
-        _cleanup_esp_audio()
-        audio_id = f"{uuid.uuid4()}.wav"
-        audio_path = os.path.join(ESP_AUDIO_DIR, audio_id)
-        try:
-            modl.synthesize_speech(answer_translated, lang, audio_path)
-            audio_url = f"/esp/audio/{audio_id}"
-        except Exception as e:
-            tts_error = f"Speech synthesis failed: {e}"
-            app.logger.exception("esp_answer: speech synthesis failed")
+        audio_url, tts_error = _synthesize_to(ESP_AUDIO_DIR, "/esp/audio", answer, lang)
 
-    return jsonify({"ok": True, "answer_text": answer_translated, "audio_url": audio_url, "tts_error": tts_error})
+    return jsonify({"ok": True, "answer_text": answer, "audio_url": audio_url, "tts_error": tts_error})
 
 
 @app.route("/esp/audio/<filename>")
 def esp_audio(filename):
     if not _check_esp_auth():
         abort(401)
-    safe_name = os.path.basename(filename)
-    filepath = os.path.join(ESP_AUDIO_DIR, safe_name)
-    if not os.path.isfile(filepath):
-        abort(404)
-    return send_file(filepath, mimetype="audio/wav", conditional=False)
+    return _send_wav(ESP_AUDIO_DIR, filename)
 
 
 if __name__ == "__main__":
