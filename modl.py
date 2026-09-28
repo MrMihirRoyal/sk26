@@ -86,9 +86,53 @@ LANG_TO_BCP47 = {
 }
 
 
+# Whisper reports the detected language as an English NAME ("telugu"), not a
+# code. Taking the first two letters of that name is wrong for several
+# languages (bengali -> "be", kannada -> "ka", marathi/malayalam -> "ma",
+# punjabi -> "pu"), which silently turned their speech into "English".
+_WHISPER_NAME_TO_CODE = {
+    "english": "en", "hindi": "hi", "bengali": "bn", "marathi": "mr",
+    "telugu": "te", "tamil": "ta", "gujarati": "gu", "kannada": "kn",
+    "malayalam": "ml", "punjabi": "pa", "panjabi": "pa",
+}
+
+# Unicode script blocks -> language, used to detect TYPED text with no API
+# call. Devanagari is shared by Hindi and Marathi; Hindi is assumed.
+_SCRIPT_RANGES = (
+    (0x0900, 0x097F, "hi"), (0x0980, 0x09FF, "bn"), (0x0A00, 0x0A7F, "pa"),
+    (0x0A80, 0x0AFF, "gu"), (0x0B80, 0x0BFF, "ta"), (0x0C00, 0x0C7F, "te"),
+    (0x0C80, 0x0CFF, "kn"), (0x0D00, 0x0D7F, "ml"),
+)
+
+
 def _clamp_lang(lang_code):
     code = (lang_code or "en")[:2].lower()
     return code if code in ALLOWED_LANGS else "en"
+
+
+def lang_from_whisper(raw):
+    """Maps Whisper's language name (or a 2-letter code) to a supported code."""
+    raw = (raw or "").strip().lower()
+    code = _WHISPER_NAME_TO_CODE.get(raw) or (raw if len(raw) == 2 else "")
+    if code in ALLOWED_LANGS:
+        return code
+    if raw:
+        print(f"[modl] Whisper detected {raw!r}, which isn't one of "
+              f"{sorted(ALLOWED_LANGS)} - treating as English.")
+    return "en"
+
+
+def detect_text_language(text):
+    """Detects the language of typed text from its script (no API call).
+    Latin script (and anything unrecognised) is treated as English."""
+    counts = {}
+    for ch in text or "":
+        cp = ord(ch)
+        for lo, hi, code in _SCRIPT_RANGES:
+            if lo <= cp <= hi:
+                counts[code] = counts.get(code, 0) + 1
+                break
+    return max(counts, key=counts.get) if counts else "en"
 
 
 def bcp47_for_lang(lang_code):
@@ -164,13 +208,16 @@ def add_message(username, role, text, lang="en", source="web"):
 
 
 def get_messages(username, limit=200):
+    """The most recent `limit` messages, oldest first. (It used to return
+    the OLDEST `limit`, so after 200 messages new ones stopped appearing.)"""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, role, text, lang, source, ts FROM messages WHERE username=? ORDER BY ts ASC, id ASC LIMIT ?",
+        "SELECT id, role, text, lang, source, ts FROM messages WHERE username=? "
+        "ORDER BY ts DESC, id DESC LIMIT ?",
         (username, limit),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in reversed(rows)]
 
 
 def clear_messages(username):
@@ -368,6 +415,9 @@ def _wav_to_pcm16(raw, target_rate=None, mono=False):
     else:
         raise ValueError(f"unsupported WAV format (tag={tag}, bits={bits})")
 
+    if tag == 1 and bits == 16 and (not mono or ch == 1) and (not target_rate or rate == target_rate):
+        return raw  # already what we want - skip the decode/re-encode
+
     out_ch = ch
     if mono and ch > 1:
         samples = [sum(samples[i:i + ch]) / ch for i in range(0, len(samples) - ch + 1, ch)]
@@ -532,71 +582,61 @@ def _audio_format_from_path(audio_path):
     return ext if ext in ("wav", "flac", "pcm", "mp3") else None
 
 
-def transcribe_and_translate(audio_path):
-    """Returns dict: {text_original, lang, text_english}."""
+def transcribe(audio_path):
+    """Speech -> text in the language that was actually SPOKEN. Returns
+    {"text": original transcript, "lang": detected code}. Nothing here
+    translates anything; the transcript is never replaced by English.
+
+    Whisper runs once to detect the language (Bhashini can't). For English
+    its transcript is used as-is (no second ASR call); for Indian languages
+    Bhashini's transcript is preferred, with Whisper's as the fallback."""
     if not _groq_client and not bhashini_configured():
         raise RuntimeError("No speech-to-text backend is configured. Set GROQ_API_KEY and/or BHASHINI_USER_ID/BHASHINI_ULCA_API_KEY.")
 
-    text_original_groq = ""
-    text_english_groq = ""
-    detected_lang = "en"
-
+    groq_text, lang = "", "en"
     if _groq_client:
         try:
             with open(audio_path, "rb") as f:
-                transcription = _groq_client.audio.transcriptions.create(
+                result = _groq_client.audio.transcriptions.create(
                     file=f, model=STT_MODEL, response_format="verbose_json",
                 )
-            text_original_groq = (transcription.text or "").strip()
-            detected_lang_raw = getattr(transcription, "language", "en") or "en"
-            detected_lang = _clamp_lang(detected_lang_raw)
-            if detected_lang_raw[:2].lower() != detected_lang:
-                print(f"[modl] transcribe: Whisper detected {detected_lang_raw!r}, "
-                      f"which isn't one of {sorted(ALLOWED_LANGS)} - treating as English.")
+            groq_text = (result.text or "").strip()
+            lang = lang_from_whisper(getattr(result, "language", "en"))
         except Exception as e:
             print(f"[modl] WARNING: Groq speech recognition failed: {e}")
 
-    # Bhashini gets priority for the actual transcript, now that we know
-    # the language (from Groq above, or English by default if Groq isn't
-    # configured at all).
-    text_original = None
+    if lang == "en" and groq_text:
+        return {"text": groq_text, "lang": lang}
+
+    text = ""
     if bhashini_configured():
-        try:
-            audio_fmt = _audio_format_from_path(audio_path)
-            if audio_fmt:
-                text_original = bhashini_asr(audio_path, detected_lang, audio_fmt)
-            else:
-                print("[modl] Bhashini ASR skipped: audio isn't WAV/FLAC/PCM/MP3, using Groq's transcript.")
-        except Exception as e:
-            print(f"[modl] Bhashini ASR failed ({e}), using Groq's transcript instead.")
-
-    if not text_original:
-        text_original = text_original_groq
-
-    if detected_lang == "en":
-        text_english = text_original
-    else:
-        text_english = None
-        if bhashini_configured() and text_original:
+        fmt = _audio_format_from_path(audio_path)
+        if fmt:
             try:
-                text_english = bhashini_translate(text_original, detected_lang, "en")
+                text = bhashini_asr(audio_path, lang, fmt)
             except Exception as e:
-                print(f"[modl] Bhashini translate-to-English failed ({e}), falling back to Groq.")
+                print(f"[modl] Bhashini ASR failed ({e}), using Groq's transcript instead.")
+        else:
+            print("[modl] Bhashini ASR skipped: audio isn't WAV/FLAC/PCM/MP3, using Groq's transcript.")
+    return {"text": text or groq_text, "lang": lang}
 
-        if not text_english and _groq_client:
-            try:
-                with open(audio_path, "rb") as f:
-                    translation = _groq_client.audio.translations.create(
-                        file=f, model=STT_MODEL, response_format="verbose_json",
-                    )
-                text_english = (translation.text or "").strip()
-            except Exception as e:
-                print(f"[modl] WARNING: Groq translation-to-English failed: {e}")
 
-        if not text_english:
-            text_english = text_original  # last resort - better than nothing
+def to_english(text, lang):
+    """English version of `text`, for the answer step ONLY - never used for
+    display. Bhashini first, then the Groq chat model (text-only; the old
+    fallback re-uploaded the whole audio file just to translate it)."""
+    lang = _clamp_lang(lang)
+    if not text or lang == "en":
+        return text
+    return _translate(text, lang, "en")
 
-    return {"text_original": text_original or "", "lang": detected_lang, "text_english": text_english or ""}
+
+def transcribe_and_translate(audio_path):
+    """Used by the ESP32 endpoint, whose protocol carries both the original
+    and the English text. `text_original` is exactly what was spoken."""
+    stt = transcribe(audio_path)
+    return {"text_original": stt["text"], "lang": stt["lang"],
+            "text_english": to_english(stt["text"], stt["lang"])}
 
 
 # ---------------------------------------------------------------------------
@@ -677,45 +717,55 @@ def answer_query(question_en, history=None, mode=None):
         return f"Sorry, something went wrong while generating a response: {e}"
 
 
-def translate_text(text, target_lang_code):
-    """Translates English text into the target language. Bhashini has
-    priority (better quality for Indian languages); falls back to the
-    Groq chat model on any Bhashini failure or if it isn't configured."""
-    target_lang_code = _clamp_lang(target_lang_code)
-    if not text or target_lang_code == "en":
+def _translate(text, src, tgt):
+    """Translates between English and a supported language. Bhashini has
+    priority (better quality for Indian languages); falls back to the Groq
+    chat model on any Bhashini failure or if it isn't configured. Returns
+    the input unchanged if nothing can translate it."""
+    if not text or src == tgt:
         return text
 
     if bhashini_configured():
         try:
-            return bhashini_translate(text, "en", target_lang_code)
+            return bhashini_translate(text, src, tgt)
         except Exception as e:
-            print(f"[modl] Bhashini translate failed ({e}), falling back to Groq.")
+            print(f"[modl] Bhashini translate {src}->{tgt} failed ({e}), falling back to Groq.")
 
     if not _groq_client:
         return text
 
-    lang_name = LANG_NAMES[target_lang_code]
+    src_name, tgt_name = LANG_NAMES[src], LANG_NAMES[tgt]
     system_prompt = (
-        f"Translate the given English text fully into {lang_name}, using the "
-        f"native script for {lang_name}. Translate every sentence - do not "
-        f"leave any part of the text in English, including sentences that "
+        f"Translate the given {src_name} text fully into {tgt_name}, using the "
+        f"native script for {tgt_name}. Translate every sentence - do not "
+        f"leave any part of the text in {src_name}, including sentences that "
         f"mix in numbers or technical terms; only proper nouns and numerals "
         f"themselves may stay as-is. Reply with only the translation, "
         f"nothing else."
     )
     try:
         resp = _groq_client.chat.completions.create(
-            model=CHAT_MODEL,
-            max_tokens=1200,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
+            model=CHAT_MODEL, max_tokens=1200, temperature=0.2,
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": text}],
         )
         return resp.choices[0].message.content.strip()
     except Exception:
         return text
+
+
+def translate_text(text, target_lang_code):
+    """Translates English text into the target language."""
+    return _translate(text, "en", _clamp_lang(target_lang_code))
+
+
+def respond(text, lang, history=None, text_english=None):
+    """Full answer flow for one question, returning the reply in `lang`.
+    The question is translated to English only here, because that is what
+    the answer step needs; the caller keeps and displays the original."""
+    lang = _clamp_lang(lang)
+    question_en = text_english or to_english(text, lang)
+    return translate_text(answer_query(question_en, history), lang)
 
 
 # ---------------------------------------------------------------------------
